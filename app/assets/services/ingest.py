@@ -1,16 +1,20 @@
 """Turns incoming bytes into catalogued assets: multipart uploads moved into a
 hash-addressed destination, files registered where they already sit, and
 records created from a hash the catalog already holds. Every path persists the
-stat that hashing verified, so a row's recorded size and mtime describe the
-same observation as its hash. A live row already at the destination is
+stat that hashing verified (for an upload copied across volumes, the stat of a
+copy taken from that verified file), so a row's recorded size and mtime describe
+the same observation as its hash. A live row already at the destination is
 reconciled before the write, so an upload never adopts a fresh hash onto
 records created for bytes it just replaced.
 """
 
 import contextlib
+import errno
 import logging
 import mimetypes
 import os
+import secrets
+import shutil
 from typing import Any, NamedTuple, Sequence
 
 from sqlalchemy import func, select
@@ -184,10 +188,66 @@ def _guess_upload_mime_type(
     return guessed or "application/octet-stream"
 
 
-def _move_temp_to_dest(temp_path: str, dest_abs: str) -> None:
+_STAGING_NAME_ATTEMPTS = 16
+
+
+def _create_staging_file(directory: str) -> tuple[int, str]:
+    """Not tempfile.mkstemp: on Windows it retries PermissionError until TMP_MAX
+    when an ACL denies writes, hanging the upload."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    for _ in range(_STAGING_NAME_ATTEMPTS):
+        path = os.path.join(directory, f".{secrets.token_hex(8)}.upload.tmp")
+        try:
+            return os.open(path, flags, 0o666), path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"no free staging name in {directory}")
+
+
+def _copy_across_devices(
+    temp_path: str, dest_abs: str, verified_stat: os.stat_result
+) -> os.stat_result:
+    """Copy to a hidden sibling of ``dest_abs``, then rename it into place, so a
+    partial copy is never visible under the final name. The source must still
+    match the stat hashing verified once the copy is done. Returns the copy's
+    stat."""
+    fd, staging = _create_staging_file(os.path.dirname(dest_abs))
+    try:
+        with os.fdopen(fd, "wb") as dst, open(temp_path, "rb") as src:
+            shutil.copyfileobj(src, dst)
+            source_stat = os.fstat(src.fileno())
+        if (source_stat.st_size, source_stat.st_mtime_ns) != (
+            verified_stat.st_size,
+            verified_stat.st_mtime_ns,
+        ):
+            raise OSError("upload file changed after hashing")
+        # Best effort: mode bits cannot be set on some filesystems (e.g. FAT).
+        with contextlib.suppress(OSError):
+            shutil.copymode(temp_path, staging)
+        copied_stat = os.stat(staging)
+        os.replace(staging, dest_abs)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(staging)
+        raise
+    return copied_stat
+
+
+def _move_temp_to_dest(
+    temp_path: str, dest_abs: str, verified_stat: os.stat_result
+) -> os.stat_result:
+    """Move the upload into place and return the stat to record for it. A copy
+    across volumes (EXDEV, also Windows' ERROR_NOT_SAME_DEVICE) can change the
+    mtime, so that case records the copy's own stat."""
     os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
     try:
-        os.replace(temp_path, dest_abs)
+        try:
+            os.replace(temp_path, dest_abs)
+            return verified_stat
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+        return _copy_across_devices(temp_path, dest_abs, verified_stat)
     except Exception as e:
         raise RuntimeError(f"failed to move uploaded file into place: {e}") from e
 
@@ -486,10 +546,10 @@ def upload_from_temp_path(
         content_type = _guess_upload_mime_type(
             mime_type, client_filename, name, os.path.basename(dest_abs)
         )
-        _move_temp_to_dest(temp_path, dest_abs)
+        placed_stat = _move_temp_to_dest(temp_path, dest_abs, verified_stat)
     finally:
         _remove_temp_path(temp_path)
-    size_bytes, mtime_ns = verified_stat.st_size, verified_stat.st_mtime_ns
+    size_bytes, mtime_ns = placed_stat.st_size, placed_stat.st_mtime_ns
     system_metadata = _extract_system_metadata_sync(dest_abs, content_type)
     with create_session() as session:
         _reconcile_live_content_at_path(
